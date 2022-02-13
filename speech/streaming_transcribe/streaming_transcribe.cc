@@ -15,6 +15,7 @@
 #include <google/cloud/grpc_options.h>
 #include <google/cloud/speech/speech_client.h>
 #include <boost/endian.hpp>
+#include <fmt/format.h>
 #include <RtAudio.h>
 #include <iostream>
 #include <mutex>
@@ -87,7 +88,7 @@ class MicrophoneExample : public AudioSource {
 // any form of compression, it seems we should use the minimum recommended rate
 // to save bandwidth.
 auto constexpr kMinimumSampleRate = static_cast<unsigned int>(16000);
-auto constexpr kBufferTime = std::chrono::seconds(2);
+auto constexpr kBufferTime = std::chrono::seconds(1);
 auto constexpr kInitialBackoff = std::chrono::milliseconds(500);
 
 class Transcribe {
@@ -198,7 +199,11 @@ class Transcribe {
     if (!response.has_value()) return Reset(std::move(lk));
     pending_read_ = true;
     stream_->Read().then([this](auto f) { OnRead(f.get()); });
-    std::cout << response->DebugString() << std::endl;
+    for (auto const& r : response->results()) {
+      if (r.alternatives().empty()) continue;
+      auto const& best = r.alternatives(0);
+      std::cout << "[" << best.confidence() << "] " << best.transcript() << "\n";
+    }
   }
 
   void OnWrite(bool ok) {
@@ -281,14 +286,35 @@ MicrophoneExample::MicrophoneExample() {
   }
 
   auto info = adc_.getDeviceInfo(adc_.getDefaultInputDevice());
+  std::cout << "Using audio device " << info.name << " supported formats ";
+  struct Format {
+    std::string name;
+    RtAudioFormat format;
+  } formats[] = {
+      {"RTAUDIO_SINT8", RTAUDIO_SINT8},
+      {"RTAUDIO_SINT16", RTAUDIO_SINT16},
+      {"RTAUDIO_SINT24", RTAUDIO_SINT24},
+      {"RTAUDIO_SINT32", RTAUDIO_SINT32},
+      {"RTAUDIO_FLOAT32", RTAUDIO_FLOAT32},
+      {"RTAUDIO_FLOAT64", RTAUDIO_FLOAT64},
+  };
+  for (auto const& f : formats) {
+    if ((info.nativeFormats & f.format) == 0) continue;
+    std::cout << " " << f.name;
+  }
+  std::cout << std::endl;
+//  if ((info.nativeFormats & RTAUDIO_SINT16) == 0) {
+//    throw std::runtime_error(fmt::format(
+//        "The device ({}) does not support LINEAR16 sampling", info.name));
+//  }
   auto rates = info.sampleRates;
   std::sort(rates.begin(), rates.end());
   auto loc = std::find_if(rates.begin(), rates.end(),
                           [](auto rate) { return rate >= kMinimumSampleRate; });
   if (loc == rates.end()) {
     throw std::runtime_error(
-        "all available samples rates are too low, minimum is " +
-        std::to_string(kMinimumSampleRate));
+        fmt::format("The device ({}) supported sampling rates are all below {}",
+                    info.name, kMinimumSampleRate));
   }
   sample_rate_ = *loc;
   std::cout << "Sampling at " << sample_rate_ << std::endl;

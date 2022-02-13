@@ -6,7 +6,8 @@
   "dependencies": [
     {"name":  "google-cloud-cpp", "features":  ["speech"], "default-features":  false},
     "rtaudio",
-    "boost-endian"
+    "boost-endian",
+    "fmt"
   ],
   "builtin-baseline": "d1a87fc3eae7980bbf3793ebcfa2cd10924af02e"
 }

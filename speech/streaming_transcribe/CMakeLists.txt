@@ -14,10 +14,11 @@
 
 set(VCPKG_OVERLAY_PORTS ${CMAKE_SOURCE_DIR}/vcpkg-overlay)
 
-cmake_minimum_required(VERSION 3.16)
-project(google-cloud-cpp-speech-quickstart CXX)
+cmake_minimum_required(VERSION 3.12)
+project(streaming-transcribe CXX)
 
 find_package(google_cloud_cpp_speech REQUIRED)
+find_package(fmt CONFIG REQUIRED)
 find_package(RtAudio CONFIG REQUIRED)
 
 # MSVC requires some additional code to select the correct runtime library
@@ -29,5 +30,6 @@ endif ()
 
 # Define your targets.
 add_executable(streaming_transcribe streaming_transcribe.cc)
-target_link_libraries(streaming_transcribe PRIVATE google-cloud-cpp::experimental-speech RtAudio::rtaudio)
+target_link_libraries(streaming_transcribe PRIVATE
+        google-cloud-cpp::experimental-speech RtAudio::rtaudio fmt::fmt)
 target_compile_features(streaming_transcribe PRIVATE cxx_std_20)
