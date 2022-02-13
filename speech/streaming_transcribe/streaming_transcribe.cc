@@ -60,7 +60,7 @@ class AudioSource {
 
 class MicrophoneExample : public AudioSource {
  public:
-  MicrophoneExample() = default;
+  MicrophoneExample();
   ~MicrophoneExample() override;
 
   void RunBackground();
@@ -77,6 +77,7 @@ class MicrophoneExample : public AudioSource {
                              RtAudioStreamStatus /*status*/, void* user_data);
 
   RtAudio adc_;
+  unsigned int sample_rate_ = 0;
 
   std::mutex mu_;
   std::string buffer_;
@@ -85,14 +86,17 @@ class MicrophoneExample : public AudioSource {
 // Cloud Speech recommends at least 16 Khz sampling. Since we are not using
 // any form of compression, it seems we should use the minimum recommended rate
 // to save bandwidth.
-auto constexpr kSampleRate = static_cast<unsigned int>(16000);
+auto constexpr kMinimumSampleRate = static_cast<unsigned int>(16000);
 auto constexpr kBufferTime = std::chrono::seconds(2);
 auto constexpr kInitialBackoff = std::chrono::milliseconds(500);
 
 class Transcribe {
  public:
-  Transcribe(std::unique_ptr<AudioSource> source, gc::CompletionQueue cq)
-      : source_(std::move(source)), cq_(std::move(cq)) {}
+  Transcribe(std::unique_ptr<AudioSource> source, gc::CompletionQueue cq,
+             speech::SpeechClient client)
+      : source_(std::move(source)),
+        cq_(std::move(cq)),
+        client_(std::move(client)) {}
 
   gc::future<void> Run() {
     StartRecognitionStream(kInitialBackoff);
@@ -180,6 +184,7 @@ class Transcribe {
     auto stream = stream_;
     lk.unlock();
 
+    std::cout << "About to write " << audio.size() / 2 << " samples\n";
     speech::v1::StreamingRecognizeRequest request;
     request.set_audio_content(std::move(audio));
     stream->Write(request, grpc::WriteOptions()).then([this](auto f) {
@@ -229,11 +234,8 @@ class Transcribe {
   gc::CompletionQueue cq_;
   gc::promise<void> done_;
 
-  speech::SpeechClient client_ =
-      speech::SpeechClient(speech::MakeSpeechConnection(
-          gc::Options{}.set<gc::GrpcCompletionQueueOption>(cq_)));
+  speech::SpeechClient client_;
 
-  speech::v1::StreamingRecognizeRequest queue_;
   std::mutex mu_;
   std::shared_ptr<RecognitionStream> stream_;
   bool pending_read_ = false;
@@ -246,13 +248,15 @@ int main(int argc, char* argv[]) try {
     return 1;
   }
 
-  auto mic = std::unique_ptr<MicrophoneExample>();
+  auto mic = std::make_unique<MicrophoneExample>();
+  mic->RunBackground();
+
   gc::CompletionQueue cq;
   auto background = std::thread([](auto cq) { cq.Run(); }, cq);
 
-  mic->RunBackground();
-
-  Transcribe transcribe(std::move(mic), cq);
+  auto client = speech::SpeechClient(speech::MakeSpeechConnection(
+      gc::Options{}.set<gc::GrpcCompletionQueueOption>(cq)));
+  Transcribe transcribe(std::move(mic), cq, client);
 
   auto done = transcribe.Run();
 
@@ -271,15 +275,23 @@ int main(int argc, char* argv[]) try {
   return 1;
 }
 
-MicrophoneExample::~MicrophoneExample() {
-  adc_.stopStream();
-  if (adc_.isStreamOpen()) adc_.closeStream();
-}
-
-void MicrophoneExample::RunBackground() {
+MicrophoneExample::MicrophoneExample() {
   if (adc_.getDeviceCount() < 1) {
     throw std::runtime_error("No audio devices found");
   }
+
+  auto info = adc_.getDeviceInfo(adc_.getDefaultInputDevice());
+  auto rates = info.sampleRates;
+  std::sort(rates.begin(), rates.end());
+  auto loc = std::find_if(rates.begin(), rates.end(),
+                          [](auto rate) { return rate >= kMinimumSampleRate; });
+  if (loc == rates.end()) {
+    throw std::runtime_error(
+        "all available samples rates are too low, minimum is " +
+        std::to_string(kMinimumSampleRate));
+  }
+  sample_rate_ = *loc;
+  std::cout << "Sampling at " << sample_rate_ << std::endl;
 
   RtAudio::StreamParameters parameters;
   parameters.deviceId = adc_.getDefaultInputDevice();
@@ -287,19 +299,26 @@ void MicrophoneExample::RunBackground() {
   parameters.firstChannel = 0;
 
   auto buffer_frames = static_cast<unsigned int>(
-      std::chrono::seconds(kBufferTime).count() * kSampleRate);
-  adc_.openStream(nullptr, &parameters, RTAUDIO_SINT16, kSampleRate,
-                  &buffer_frames, &record_callback);
-
-  adc_.startStream();
+      std::chrono::seconds(kBufferTime).count() * sample_rate_);
+  adc_.openStream(nullptr, &parameters, RTAUDIO_SINT16, sample_rate_,
+                  &buffer_frames, &record_callback, this);
 }
+
+MicrophoneExample::~MicrophoneExample() try {
+  adc_.stopStream();
+  if (adc_.isStreamOpen()) adc_.closeStream();
+} catch (RtAudioError const& e) {
+  e.printMessage();
+}
+
+void MicrophoneExample::RunBackground() { adc_.startStream(); }
 
 speech::v1::StreamingRecognitionConfig MicrophoneExample::Config() {
   speech::v1::StreamingRecognitionConfig config;
   auto& cfg = *config.mutable_config();
   cfg.set_language_code("en-US");
   cfg.set_encoding(speech::v1::RecognitionConfig::LINEAR16);
-  cfg.set_sample_rate_hertz(kSampleRate);
+  cfg.set_sample_rate_hertz(sample_rate_);
   return config;
 }
 
