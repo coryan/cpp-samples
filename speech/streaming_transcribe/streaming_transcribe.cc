@@ -91,6 +91,8 @@ auto constexpr kMinimumSampleRate = static_cast<unsigned int>(16000);
 auto constexpr kBufferTime = std::chrono::seconds(1);
 auto constexpr kInitialBackoff = std::chrono::milliseconds(500);
 
+auto constexpr kMinimumCommandConfidence = 0.90;
+
 class Transcribe {
  public:
   Transcribe(std::unique_ptr<AudioSource> source, gc::CompletionQueue cq,
@@ -207,12 +209,10 @@ class Transcribe {
         std::transform(cmd.begin(), cmd.end(), cmd.begin(), [](auto c) {
           return static_cast<char>(std::tolower(c));
         });
-        auto l = cmd.find("stop stop stop");
-        if (l != std::string::npos && a.confidence() > 0.90) {
-          std::cerr << "*** stopping " << std::endl;
+        if (a.confidence() < kMinimumCommandConfidence) continue;
+        if (cmd.find("stop stop stop") != std::string::npos) {
+          std::cerr << "DEBUG: *** stopping " << std::endl;
           return Shutdown(std::move(lk));
-        } else {
-          std::cout << "DEBUG: " << l << "\n";
         }
       }
     }
@@ -238,12 +238,18 @@ class Transcribe {
     auto stream = std::move(stream_);
     lk.unlock();
     if (!stream) return;
-    stream->Finish().then([this](auto f) { OnReset(f.get()); });
+    auto wd = stream->WritesDone();
+    wd.then([this, s = std::move(stream)](auto f) {
+      s->Finish().then([this](auto g) { OnReset(g.get()); });
+      });
   }
 
   void OnReset(gc::Status const& status) {
     std::unique_lock lk(mu_);
+    std::cout << "DEBUG: OnReset() - status=" << status
+              << ", shutdown=" << shutdown_ << std::endl;
     if (shutdown_) {
+      std::cout << "DEBUG: *** signal future" << std::endl;
       done_.set_value();
       return;
     }
