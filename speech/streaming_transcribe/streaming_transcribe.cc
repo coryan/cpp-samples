@@ -126,9 +126,9 @@ class Transcribe {
     }
     std::unique_lock lk(mu_);
     stream_ = std::move(s);
-    pending_write_ = true;
-    auto stream = stream_;
-    lk.unlock();
+    auto stream = PrepareWrite(std::move(lk));
+    if (!stream) return;
+
     speech::v1::StreamingRecognizeRequest request;
     *request.mutable_streaming_config() = source_->Config();
     stream->Write(request, grpc::WriteOptions()).then([this](auto f) {
@@ -141,7 +141,7 @@ class Transcribe {
     if (status.code() != gc::StatusCode::kUnavailable) {
       std::cerr << "Unrecoverable error starting recognition stream: " << status
                 << "\n";
-      return Shutdown();
+      return Shutdown(std::unique_lock(mu_));
     }
     cq_.MakeRelativeTimer(backoff).then([this, b = 2 * backoff](auto f) {
       auto status = f.get().status();
@@ -152,16 +152,15 @@ class Transcribe {
 
   void OnTimerError(gc::Status const& status) {
     std::cerr << "Unrecoverable error in backoff timer: " << status << "\n";
-    return Shutdown();
+    return Shutdown(std::unique_lock(mu_));
   }
 
   void OnWriteConfig(bool ok) {
     std::unique_lock lk(mu_);
     pending_write_ = false;
     if (!ok) return Reset(std::move(lk));
-    pending_read_ = true;
-    auto stream = stream_;
-    lk.unlock();
+    auto stream = PrepareRead(std::move(lk));
+    if (!stream) return;
 
     stream->Read().then([this](auto f) { OnRead(f.get()); });
     WriteAudio();
@@ -181,11 +180,10 @@ class Transcribe {
       return;
     }
     std::unique_lock lk(mu_);
-    pending_write_ = true;
-    auto stream = stream_;
-    lk.unlock();
+    sample_count_ += audio.size();
+    auto stream = PrepareWrite(std::move(lk));
+    if (!stream) return;
 
-    std::cout << "About to write " << audio.size() / 2 << " samples\n";
     speech::v1::StreamingRecognizeRequest request;
     request.set_audio_content(std::move(audio));
     stream->Write(request, grpc::WriteOptions()).then([this](auto f) {
@@ -195,15 +193,33 @@ class Transcribe {
 
   void OnRead(absl::optional<speech::v1::StreamingRecognizeResponse> response) {
     std::unique_lock lk(mu_);
-    pending_write_ = false;
+    pending_read_ = false;
     if (!response.has_value()) return Reset(std::move(lk));
-    pending_read_ = true;
-    stream_->Read().then([this](auto f) { OnRead(f.get()); });
+    auto count = sample_count_;
+    sample_count_ = 0;
+
     for (auto const& r : response->results()) {
       if (r.alternatives().empty()) continue;
-      auto const& best = r.alternatives(0);
-      std::cout << "[" << best.confidence() << "] " << best.transcript() << "\n";
+      for (auto const& a : r.alternatives()) {
+        std::cout << "[" << count << ":" << a.confidence() << "] "
+                  << a.transcript() << "\n";
+        auto cmd = a.transcript();
+        std::transform(cmd.begin(), cmd.end(), cmd.begin(), [](auto c) {
+          return static_cast<char>(std::tolower(c));
+        });
+        auto l = cmd.find("stop stop stop");
+        if (l != std::string::npos && a.confidence() > 0.90) {
+          std::cerr << "*** stopping " << std::endl;
+          return Shutdown(std::move(lk));
+        } else {
+          std::cout << "DEBUG: " << l << "\n";
+        }
+      }
     }
+
+    auto stream = PrepareRead(std::move(lk));
+    if (!stream) return;
+    stream->Read().then([this](auto f) { OnRead(f.get()); });
   }
 
   void OnWrite(bool ok) {
@@ -216,24 +232,57 @@ class Transcribe {
   }
 
   void Reset(std::unique_lock<std::mutex> lk) {
+    std::cout << "DEBUG: Reset() - pending_read=" << pending_read_
+              << " pending_write=" << pending_write_ << std::endl;
     if (pending_write_ or pending_read_) return;
     auto stream = std::move(stream_);
     lk.unlock();
+    if (!stream) return;
     stream->Finish().then([this](auto f) { OnReset(f.get()); });
   }
 
   void OnReset(gc::Status const& status) {
+    std::unique_lock lk(mu_);
+    if (shutdown_) {
+      done_.set_value();
+      return;
+    }
+    lk.unlock();
     if (status.code() != gc::StatusCode::kUnavailable) {
       // TODO(coryan) - consider ignoring all errors after a successful
       //     read+write.
       std::cerr << "Unrecoverable error during read/write " << status << "\n";
-      return Shutdown();
     }
     std::cout << "Recovering from connection reset " << status << "\n";
     return StartRecognitionStream(kInitialBackoff);
   }
 
-  void Shutdown() { done_.set_value(); }
+  void Shutdown(std::unique_lock<std::mutex> lk) {
+    std::cout << "DEBUG: Shutdown() - pending_read=" << pending_read_
+              << " pending_write=" << pending_write_ << std::endl;
+    shutdown_ = true;
+    Reset(std::move(lk));
+  }
+
+  std::shared_ptr<RecognitionStream> PrepareRead(
+      std::unique_lock<std::mutex> lk) {
+    if (shutdown_) {
+      Reset(std::move(lk));
+      return {};
+    }
+    pending_read_ = true;
+    return stream_;
+  }
+
+  std::shared_ptr<RecognitionStream> PrepareWrite(
+      std::unique_lock<std::mutex> lk) {
+    if (shutdown_) {
+      Reset(std::move(lk));
+      return {};
+    }
+    pending_write_ = true;
+    return stream_;
+  }
 
   std::unique_ptr<AudioSource> source_;
   gc::CompletionQueue cq_;
@@ -245,6 +294,8 @@ class Transcribe {
   std::shared_ptr<RecognitionStream> stream_;
   bool pending_read_ = false;
   bool pending_write_ = false;
+  bool shutdown_ = false;
+  std::uint64_t sample_count_ = 0;
 };
 
 int main(int argc, char* argv[]) try {
@@ -303,10 +354,10 @@ MicrophoneExample::MicrophoneExample() {
     std::cout << " " << f.name;
   }
   std::cout << std::endl;
-//  if ((info.nativeFormats & RTAUDIO_SINT16) == 0) {
-//    throw std::runtime_error(fmt::format(
-//        "The device ({}) does not support LINEAR16 sampling", info.name));
-//  }
+  //  if ((info.nativeFormats & RTAUDIO_SINT16) == 0) {
+  //    throw std::runtime_error(fmt::format(
+  //        "The device ({}) does not support LINEAR16 sampling", info.name));
+  //  }
   auto rates = info.sampleRates;
   std::sort(rates.begin(), rates.end());
   auto loc = std::find_if(rates.begin(), rates.end(),
@@ -344,7 +395,7 @@ speech::v1::StreamingRecognitionConfig MicrophoneExample::Config() {
   auto& cfg = *config.mutable_config();
   cfg.set_language_code("en-US");
   cfg.set_encoding(speech::v1::RecognitionConfig::LINEAR16);
-  cfg.set_sample_rate_hertz(sample_rate_);
+  cfg.set_sample_rate_hertz(static_cast<std::int32_t>(sample_rate_));
   return config;
 }
 
