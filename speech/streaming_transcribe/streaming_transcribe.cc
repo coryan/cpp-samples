@@ -27,28 +27,19 @@ namespace gc = ::google::cloud;
 
 class AudioSource {
  public:
-  virtual ~AudioSource() = 0;
+  virtual ~AudioSource() = default;
 
   /**
    * The configuration callback.
    *
    * Use this function to return the encoding, sampling rate, expected language,
    * and any other configuration parameters required by Cloud Speech.
-   */
-  virtual ::google::cloud::speech::v1::RecognitionConfig Config() = 0;
-
-  /**
-   * The start of stream callback.
    *
-   * @note the stream may be interrupted multiple times during its lifetime, if
-   *     you are using an encoding other than `LINEAR16` you may need to resend
-   *     any encoding headers in this request.
-   *
-   * @return the encoded bytes to send with the stream. Note that some encodings
-   *   require byte order transformations. If the returned string is empty,
-   *   the transcriber will use `Backoff()` to try again.
+   * @note the stream may be interrupted multiple times during its lifetime. If
+   *     the encoding requires it, the next call to `GetAudio()` needs to
+   *     include any encoding header data.
    */
-  virtual std::string StartStream() = 0;
+  virtual ::google::cloud::speech::v1::StreamingRecognitionConfig Config() = 0;
 
   /**
    * The audio data callback.
@@ -74,8 +65,7 @@ class MicrophoneExample : public AudioSource {
 
   void RunBackground();
 
-  ::google::cloud::speech::v1::RecognitionConfig Config() override;
-  std::string StartStream() override;
+  ::google::cloud::speech::v1::StreamingRecognitionConfig Config() override;
   std::string GetAudio() override;
   std::chrono::milliseconds Backoff() override;
 
@@ -93,25 +83,26 @@ class MicrophoneExample : public AudioSource {
 };
 
 // Cloud Speech recommends at least 16 Khz sampling. Since we are not using
-// any form of compression, it seems better to
+// any form of compression, it seems we should use the minimum recommended rate
+// to save bandwidth.
 auto constexpr kSampleRate = static_cast<unsigned int>(16000);
 auto constexpr kBufferTime = std::chrono::seconds(2);
+auto constexpr kInitialBackoff = std::chrono::milliseconds(500);
 
 class Transcribe {
  public:
-  Transcribe(std::unique_ptr<AudioSource> source, gc::CompletionQueue cq) : source_(std::move(source)), cq_(std::move(cq)) {}
+  Transcribe(std::unique_ptr<AudioSource> source, gc::CompletionQueue cq)
+      : source_(std::move(source)), cq_(std::move(cq)) {}
 
-  void Run() {
-    auto background =
-        std::thread([](gc::CompletionQueue cq) { cq.Run(); }, cq_);
-
-    StartRecognitionStream(std::chrono::milliseconds(500));
+  gc::future<void> Run() {
+    StartRecognitionStream(kInitialBackoff);
+    return done_.get_future();
   }
 
  private:
-  using RecognitionStream = std::unique_ptr<
+  using RecognitionStream =
       gc::AsyncStreamingReadWriteRpc<speech::v1::StreamingRecognizeRequest,
-                                     speech::v1::StreamingRecognizeResponse>>;
+                                     speech::v1::StreamingRecognizeResponse>;
 
   void StartRecognitionStream(std::chrono::milliseconds backoff) {
     auto stream = client_.AsyncStreamingRecognize();
@@ -121,13 +112,23 @@ class Transcribe {
     });
   }
 
-  void OnStart(RecognitionStream stream, std::chrono::milliseconds backoff,
-               bool ok) {
+  void OnStart(std::unique_ptr<RecognitionStream> s,
+               std::chrono::milliseconds backoff, bool ok) {
     if (!ok) {
-      stream->Finish().then(
+      s->Finish().then(
           [this, backoff](auto f) { return OnStartError(f.get(), backoff); });
       return;
     }
+    std::unique_lock lk(mu_);
+    stream_ = std::move(s);
+    pending_write_ = true;
+    auto stream = stream_;
+    lk.unlock();
+    speech::v1::StreamingRecognizeRequest request;
+    *request.mutable_streaming_config() = source_->Config();
+    stream->Write(request, grpc::WriteOptions()).then([this](auto f) {
+      OnWriteConfig(f.get());
+    });
   }
 
   void OnStartError(gc::Status const& status,
@@ -149,11 +150,84 @@ class Transcribe {
     return Shutdown();
   }
 
-  void Shutdown() {
+  void OnWriteConfig(bool ok) {
+    std::unique_lock lk(mu_);
+    pending_write_ = false;
+    if (!ok) return Reset(std::move(lk));
+    pending_read_ = true;
+    auto stream = stream_;
+    lk.unlock();
+
+    stream->Read().then([this](auto f) { OnRead(f.get()); });
+    WriteAudio();
   }
+
+  void OnWriteBackoff(gc::Status const& status) {
+    if (!status.ok()) return Reset(std::unique_lock(mu_));
+    WriteAudio();
+  }
+
+  void WriteAudio() {
+    auto audio = source_->GetAudio();
+    if (audio.empty()) {
+      cq_.MakeRelativeTimer(source_->Backoff()).then([this](auto f) {
+        OnWriteBackoff(f.get().status());
+      });
+      return;
+    }
+    std::unique_lock lk(mu_);
+    pending_write_ = true;
+    auto stream = stream_;
+    lk.unlock();
+
+    speech::v1::StreamingRecognizeRequest request;
+    request.set_audio_content(std::move(audio));
+    stream->Write(request, grpc::WriteOptions()).then([this](auto f) {
+      OnWrite(f.get());
+    });
+  }
+
+  void OnRead(absl::optional<speech::v1::StreamingRecognizeResponse> response) {
+    std::unique_lock lk(mu_);
+    pending_write_ = false;
+    if (!response.has_value()) return Reset(std::move(lk));
+    pending_read_ = true;
+    stream_->Read().then([this](auto f) { OnRead(f.get()); });
+    std::cout << response->DebugString() << std::endl;
+  }
+
+  void OnWrite(bool ok) {
+    {
+      std::unique_lock lk(mu_);
+      pending_write_ = false;
+      if (!ok) return Reset(std::move(lk));
+    }
+    WriteAudio();
+  }
+
+  void Reset(std::unique_lock<std::mutex> lk) {
+    if (pending_write_ or pending_read_) return;
+    auto stream = std::move(stream_);
+    lk.unlock();
+    stream->Finish().then([this](auto f) { OnReset(f.get()); });
+  }
+
+  void OnReset(gc::Status const& status) {
+    if (status.code() != gc::StatusCode::kUnavailable) {
+      // TODO(coryan) - consider ignoring all errors after a successful
+      //     read+write.
+      std::cerr << "Unrecoverable error during read/write " << status << "\n";
+      return Shutdown();
+    }
+    std::cout << "Recovering from connection reset " << status << "\n";
+    return StartRecognitionStream(kInitialBackoff);
+  }
+
+  void Shutdown() { done_.set_value(); }
 
   std::unique_ptr<AudioSource> source_;
   gc::CompletionQueue cq_;
+  gc::promise<void> done_;
 
   speech::SpeechClient client_ =
       speech::SpeechClient(speech::MakeSpeechConnection(
@@ -161,7 +235,7 @@ class Transcribe {
 
   speech::v1::StreamingRecognizeRequest queue_;
   std::mutex mu_;
-  RecognitionStream stream_;
+  std::shared_ptr<RecognitionStream> stream_;
   bool pending_read_ = false;
   bool pending_write_ = false;
 };
@@ -172,18 +246,20 @@ int main(int argc, char* argv[]) try {
     return 1;
   }
 
-  RtAudio adc;
+  auto mic = std::unique_ptr<MicrophoneExample>();
+  gc::CompletionQueue cq;
+  auto background = std::thread([](auto cq) { cq.Run(); }, cq);
 
-  std::cout << "\nRecording ... press <enter> to quit.\n";
-  std::cin.get();
+  mic->RunBackground();
 
-  auto client = speech::SpeechClient(speech::MakeSpeechConnection());
+  Transcribe transcribe(std::move(mic), cq);
 
-  // google::cloud::speech::v1::RecognitionAudio audio;
-  // audio.set_uri(uri);
-  // auto response = client.Recognize(config, audio);
-  // if (!response) throw std::runtime_error(response.status().message());
-  // std::cout << response->DebugString() << "\n";
+  auto done = transcribe.Run();
+
+  done.get();
+
+  cq.Shutdown();
+  background.join();
 
   return 0;
 } catch (RtAudioError& e) {
@@ -195,10 +271,9 @@ int main(int argc, char* argv[]) try {
   return 1;
 }
 
-MicrophoneExample::~MicrophoneExample()  {
+MicrophoneExample::~MicrophoneExample() {
   adc_.stopStream();
   if (adc_.isStreamOpen()) adc_.closeStream();
-
 }
 
 void MicrophoneExample::RunBackground() {
@@ -217,18 +292,16 @@ void MicrophoneExample::RunBackground() {
                   &buffer_frames, &record_callback);
 
   adc_.startStream();
-
 }
 
-speech::v1::RecognitionConfig MicrophoneExample::Config() {
-  speech::v1::RecognitionConfig config;
-  config.set_language_code("en-US");
-  config.set_encoding(speech::v1::RecognitionConfig::LINEAR16);
-  config.set_sample_rate_hertz(kSampleRate);
+speech::v1::StreamingRecognitionConfig MicrophoneExample::Config() {
+  speech::v1::StreamingRecognitionConfig config;
+  auto& cfg = *config.mutable_config();
+  cfg.set_language_code("en-US");
+  cfg.set_encoding(speech::v1::RecognitionConfig::LINEAR16);
+  cfg.set_sample_rate_hertz(kSampleRate);
   return config;
 }
-
-std::string MicrophoneExample::StartStream() { return GetAudio(); }
 
 std::string MicrophoneExample::GetAudio() {
   std::lock_guard lk(mu_);
@@ -239,12 +312,15 @@ std::string MicrophoneExample::GetAudio() {
 
 std::chrono::milliseconds MicrophoneExample::Backoff() { return kBufferTime; }
 
-int MicrophoneExample::OnRecord(void* input_buffer, unsigned int buffer_frames) {
-  auto input = std::span<std::int16_t const>(static_cast<std::int16_t const*>(input_buffer), buffer_frames);
+int MicrophoneExample::OnRecord(void* input_buffer,
+                                unsigned int buffer_frames) {
+  auto input = std::span<std::int16_t const>(
+      static_cast<std::int16_t const*>(input_buffer), buffer_frames);
   auto output = std::vector<boost::endian::little_int16_buf_t>(input.size());
   std::copy(input.begin(), input.end(), output.begin());
 
-  std::span<char> bytes(reinterpret_cast<char*>(output.data()), sizeof(output[0]) * output.size());
+  std::span<char> bytes(reinterpret_cast<char*>(output.data()),
+                        sizeof(output[0]) * output.size());
 
   std::lock_guard lk(mu_);
   buffer_.append(bytes.begin(), bytes.end());
@@ -252,9 +328,9 @@ int MicrophoneExample::OnRecord(void* input_buffer, unsigned int buffer_frames) 
   return 0;
 }
 
-int MicrophoneExample::record_callback(void* /*output_buffer*/, void* input_buffer,
-                           unsigned int buffer_frames, double /*stream_time*/,
-                           RtAudioStreamStatus /*status*/, void* user_data) {
-  return reinterpret_cast<MicrophoneExample*>(user_data)->OnRecord(input_buffer, buffer_frames);
+int MicrophoneExample::record_callback(
+    void* /*output_buffer*/, void* input_buffer, unsigned int buffer_frames,
+    double /*stream_time*/, RtAudioStreamStatus /*status*/, void* user_data) {
+  return reinterpret_cast<MicrophoneExample*>(user_data)->OnRecord(
+      input_buffer, buffer_frames);
 }
-
