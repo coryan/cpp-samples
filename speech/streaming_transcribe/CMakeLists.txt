@@ -28,6 +28,6 @@ else ()
 endif ()
 
 # Define your targets.
-add_executable(streaming_transcribe infinite_transcribe.cc)
+add_executable(streaming_transcribe streaming_transcribe.cc)
 target_link_libraries(streaming_transcribe PRIVATE google-cloud-cpp::experimental-speech RtAudio::rtaudio)
 target_compile_features(streaming_transcribe PRIVATE cxx_std_20)
