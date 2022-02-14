@@ -17,6 +17,7 @@
 #include <boost/endian.hpp>
 #include <fmt/format.h>
 #include <RtAudio.h>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <span>
@@ -25,6 +26,13 @@
 
 namespace speech = ::google::cloud::speech;
 namespace gc = ::google::cloud;
+
+enum SinkAction {
+  kContinue,
+  kShutdown,
+};
+using TranscriptionSink =
+    std::function<SinkAction(speech::v1::StreamingRecognizeResponse response)>;
 
 class AudioSource {
  public:
@@ -59,31 +67,6 @@ class AudioSource {
   virtual std::chrono::milliseconds Backoff() = 0;
 };
 
-class MicrophoneExample : public AudioSource {
- public:
-  MicrophoneExample();
-  ~MicrophoneExample() override;
-
-  void RunBackground();
-
-  ::google::cloud::speech::v1::StreamingRecognitionConfig Config() override;
-  std::string GetAudio() override;
-  std::chrono::milliseconds Backoff() override;
-
- private:
-  int OnRecord(void* input_buffer, unsigned int buffer_frames);
-
-  static int record_callback(void* /*output_buffer*/, void* input_buffer,
-                             unsigned int buffer_frames, double /*stream_time*/,
-                             RtAudioStreamStatus /*status*/, void* user_data);
-
-  RtAudio adc_;
-  unsigned int sample_rate_ = 0;
-
-  std::mutex mu_;
-  std::string buffer_;
-};
-
 // Cloud Speech recommends at least 16 Khz sampling. Since we are not using
 // any form of compression, it seems we should use the minimum recommended rate
 // to save bandwidth.
@@ -95,11 +78,12 @@ auto constexpr kMinimumCommandConfidence = 0.90;
 
 class Transcribe {
  public:
-  Transcribe(std::unique_ptr<AudioSource> source, gc::CompletionQueue cq,
-             speech::SpeechClient client)
-      : source_(std::move(source)),
-        cq_(std::move(cq)),
-        client_(std::move(client)) {}
+  Transcribe(gc::CompletionQueue cq, speech::SpeechClient client,
+             std::unique_ptr<AudioSource> source, TranscriptionSink sink)
+      : cq_(std::move(cq)),
+        client_(std::move(client)),
+        source_(std::move(source)),
+        sink_(std::move(sink)) {}
 
   gc::future<void> Run() {
     StartRecognitionStream(kInitialBackoff);
@@ -181,9 +165,7 @@ class Transcribe {
       });
       return;
     }
-    std::unique_lock lk(mu_);
-    sample_count_ += audio.size();
-    auto stream = PrepareWrite(std::move(lk));
+    auto stream = PrepareWrite(std::unique_lock(mu_));
     if (!stream) return;
 
     speech::v1::StreamingRecognizeRequest request;
@@ -197,25 +179,11 @@ class Transcribe {
     std::unique_lock lk(mu_);
     pending_read_ = false;
     if (!response.has_value()) return Reset(std::move(lk));
-    auto count = sample_count_;
-    sample_count_ = 0;
 
-    for (auto const& r : response->results()) {
-      if (r.alternatives().empty()) continue;
-      for (auto const& a : r.alternatives()) {
-        std::cout << "[" << count << ":" << a.confidence() << "] "
-                  << a.transcript() << "\n";
-        auto cmd = a.transcript();
-        std::transform(cmd.begin(), cmd.end(), cmd.begin(), [](auto c) {
-          return static_cast<char>(std::tolower(c));
-        });
-        if (a.confidence() < kMinimumCommandConfidence) continue;
-        if (cmd.find("stop stop stop") != std::string::npos) {
-          std::cerr << "DEBUG: *** stopping " << std::endl;
-          return Shutdown(std::move(lk));
-        }
-      }
-    }
+    lk.unlock();
+    auto const action = sink_(*std::move(response));
+    lk.lock();
+    if (action == SinkAction::kShutdown) return Shutdown(std::move(lk));
 
     auto stream = PrepareRead(std::move(lk));
     if (!stream) return;
@@ -241,7 +209,7 @@ class Transcribe {
     auto wd = stream->WritesDone();
     wd.then([this, s = std::move(stream)](auto f) {
       s->Finish().then([this](auto g) { OnReset(g.get()); });
-      });
+    });
   }
 
   void OnReset(gc::Status const& status) {
@@ -290,19 +258,20 @@ class Transcribe {
     return stream_;
   }
 
-  std::unique_ptr<AudioSource> source_;
   gc::CompletionQueue cq_;
-  gc::promise<void> done_;
-
   speech::SpeechClient client_;
+  std::unique_ptr<AudioSource> source_;
+  TranscriptionSink sink_;
+  gc::promise<void> done_;
 
   std::mutex mu_;
   std::shared_ptr<RecognitionStream> stream_;
   bool pending_read_ = false;
   bool pending_write_ = false;
   bool shutdown_ = false;
-  std::uint64_t sample_count_ = 0;
 };
+
+std::unique_ptr<AudioSource> MakeMicrophoneSource();
 
 int main(int argc, char* argv[]) try {
   if (argc > 1) {
@@ -310,15 +279,34 @@ int main(int argc, char* argv[]) try {
     return 1;
   }
 
-  auto mic = std::make_unique<MicrophoneExample>();
-  mic->RunBackground();
+  auto mic = MakeMicrophoneSource();
 
   gc::CompletionQueue cq;
   auto background = std::thread([](auto cq) { cq.Run(); }, cq);
 
   auto client = speech::SpeechClient(speech::MakeSpeechConnection(
       gc::Options{}.set<gc::GrpcCompletionQueueOption>(cq)));
-  Transcribe transcribe(std::move(mic), cq, client);
+  Transcribe transcribe(
+      cq, client, std::move(mic),
+      [](speech::v1::StreamingRecognizeResponse const& response) {
+        for (auto const& r : response.results()) {
+          if (r.alternatives().empty()) continue;
+          for (auto const& a : r.alternatives()) {
+            std::cout << "[" << a.confidence() << "] " << a.transcript()
+                      << "\n";
+            auto cmd = a.transcript();
+            std::transform(cmd.begin(), cmd.end(), cmd.begin(), [](auto c) {
+              return static_cast<char>(std::tolower(c));
+            });
+            if (a.confidence() < kMinimumCommandConfidence) continue;
+            if (cmd.find("stop stop stop") != std::string::npos) {
+              std::cerr << "DEBUG: *** stopping " << std::endl;
+              return SinkAction::kShutdown;
+            }
+          }
+        }
+        return SinkAction::kContinue;
+      });
 
   auto done = transcribe.Run();
 
@@ -335,6 +323,37 @@ int main(int argc, char* argv[]) try {
 } catch (std::exception const& ex) {
   std::cerr << "Standard exception raised: " << ex.what() << "\n";
   return 1;
+}
+
+class MicrophoneExample : public AudioSource {
+ public:
+  MicrophoneExample();
+  ~MicrophoneExample() override;
+
+  void RunBackground();
+
+  ::google::cloud::speech::v1::StreamingRecognitionConfig Config() override;
+  std::string GetAudio() override;
+  std::chrono::milliseconds Backoff() override;
+
+ private:
+  int OnRecord(void* input_buffer, unsigned int buffer_frames);
+
+  static int record_callback(void* /*output_buffer*/, void* input_buffer,
+                             unsigned int buffer_frames, double /*stream_time*/,
+                             RtAudioStreamStatus /*status*/, void* user_data);
+
+  RtAudio adc_;
+  unsigned int sample_rate_ = 0;
+
+  std::mutex mu_;
+  std::string buffer_;
+};
+
+std::unique_ptr<AudioSource> MakeMicrophoneSource() {
+  auto mic = std::make_unique<MicrophoneExample>();
+  mic->RunBackground();
+  return mic;
 }
 
 MicrophoneExample::MicrophoneExample() {
@@ -359,15 +378,12 @@ MicrophoneExample::MicrophoneExample() {
     if ((info.nativeFormats & f.format) == 0) continue;
     std::cout << " " << f.name;
   }
+  std::cout << " supported rates";
+  for (auto const& r : info.sampleRates) std::cout << " " << r;
   std::cout << std::endl;
-  //  if ((info.nativeFormats & RTAUDIO_SINT16) == 0) {
-  //    throw std::runtime_error(fmt::format(
-  //        "The device ({}) does not support LINEAR16 sampling", info.name));
-  //  }
   auto rates = info.sampleRates;
   std::sort(rates.begin(), rates.end());
-  auto loc = std::find_if(rates.begin(), rates.end(),
-                          [](auto rate) { return rate >= kMinimumSampleRate; });
+  auto loc = std::upper_bound(rates.begin(), rates.end(), kMinimumSampleRate);
   if (loc == rates.end()) {
     throw std::runtime_error(
         fmt::format("The device ({}) supported sampling rates are all below {}",
